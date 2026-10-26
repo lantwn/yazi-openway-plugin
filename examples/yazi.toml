@@ -1,0 +1,21 @@
+# ~/.config/yazi/yazi.toml
+#
+# The plugin only needs a slightly taller/wider native picker.  Everything
+# else is optional, but the opener descriptions make the combined menu much
+# easier to read ("Edit in Yazi" vs "Neovim" in a new terminal).
+[pick]
+open_title  = "Open with:"
+open_origin = "hovered"
+open_offset = [ 0, 1, 60, 15 ]
+
+# Example descriptions.  Keep your own run commands; only desc changes here.
+# [opener]
+# edit = [
+# 	{ run = "nvim %s", desc = "Edit in Yazi (nvim)", block = true },
+# ]
+# open = [
+# 	{ run = "xdg-open %s1", desc = "Open (default)" },
+# ]
+# reveal = [
+# 	{ run = "xdg-open %d1", desc = "Reveal in file manager" },
+# ]

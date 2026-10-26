@@ -1,0 +1,13 @@
+# ~/.config/yazi/keymap.toml
+#
+# Override the default O binding with the system-application picker.
+[[mgr.prepend_keymap]]
+on   = "O"
+run  = "plugin open-with"
+desc = "Open with (native picker + system apps)"
+
+# Optional: keep a pure-yazi picker on Shift+Enter as a fallback.
+[[mgr.prepend_keymap]]
+on   = "<S-Enter>"
+run  = "open --interactive"
+desc = "Open with configured openers"

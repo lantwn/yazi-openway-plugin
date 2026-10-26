@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""GIO/XDG helper for the yazi `open-with` plugin.
+
+The plugin uses this helper for two things:
+
+  --list   Find every desktop application that can open the given files,
+           using the same GIO data Nautilus uses (default, recommended,
+           fallback and all registered apps).  Prints JSON on stdout.
+  --launch Launch one of those applications with the files.
+
+We deliberately do the launching through GAppInfo instead of parsing the
+Exec= line ourselves: GIO handles Terminal=true, field codes (%f/%F/%u/%U),
+flatpak apps and startup notification for us.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass
+
+Gio = None
+GioUnix = None
+GLib = None
+
+
+class HelperError(RuntimeError):
+    pass
+
+
+def load_gio() -> None:
+    global Gio, GioUnix, GLib
+    if Gio is not None:
+        return
+
+    try:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio as gio_module
+        from gi.repository import GLib as glib_module
+
+        try:
+            gi.require_version("GioUnix", "2.0")
+            from gi.repository import GioUnix as gio_unix_module
+        except (ImportError, ValueError):
+            # PyGObject < 3.50 only has Gio.DesktopAppInfo.
+            gio_unix_module = None
+    except Exception as exc:  # pragma: no cover - depends on host packages
+        raise HelperError(f"PyGObject/GIO is not available: {exc}") from exc
+
+    Gio = gio_module
+    GioUnix = gio_unix_module
+    GLib = glib_module
+
+
+def clean(value: object | None) -> str:
+    """Collapse whitespace so each value fits on one picker line."""
+    return " ".join(str(value or "").split())
+
+
+def content_type(path: str) -> str:
+    """Return the GIO/shared-mime-info content type for *path*."""
+    file = Gio.File.new_for_commandline_arg(path)
+    try:
+        info = file.query_info(
+            "standard::content-type",
+            Gio.FileQueryInfoFlags.NONE,
+            None,
+        )
+        mime = info.get_content_type()
+        if mime == "application/x-zerosize":
+            # Empty files have no content to sniff.  Match the behaviour of
+            # file managers: guess from the name, defaulting to text/plain.
+            guessed, _ = Gio.content_type_guess(file.get_basename() or path, None)
+            if guessed and not Gio.content_type_is_unknown(guessed):
+                return guessed
+            return "text/plain"
+        if mime:
+            return mime
+    except GLib.Error:
+        # Remote/virtual files may not support query_info(); fall back to a
+        # name-based guess rather than failing the whole selection.
+        guessed, _ = Gio.content_type_guess(file.get_basename() or path, None)
+        if guessed and not Gio.content_type_is_unknown(guessed):
+            return guessed
+        raise HelperError(f"cannot determine MIME type: {path}")
+
+    guessed, _ = Gio.content_type_guess(file.get_basename() or path, None)
+    if guessed and not Gio.content_type_is_unknown(guessed):
+        return guessed
+    raise HelperError(f"cannot determine MIME type: {path}")
+
+
+@dataclass
+class Candidate:
+    app: object
+    app_id: str
+    name: str
+    rank: int
+    is_default: bool
+
+
+def add_apps(
+    bucket: dict[str, Candidate],
+    apps,
+    rank: int,
+    default_id: str | None,
+) -> None:
+    for app in apps or []:
+        app_id = app.get_id()
+        if not app_id:
+            continue
+
+        is_default = app_id == default_id
+        previous = bucket.get(app_id)
+        if previous is None:
+            bucket[app_id] = Candidate(
+                app=app,
+                app_id=app_id,
+                name=clean(app.get_display_name()) or clean(app.get_name()) or app_id,
+                rank=rank,
+                is_default=is_default,
+            )
+        else:
+            previous.rank = min(previous.rank, rank)
+            previous.is_default = previous.is_default or is_default
+
+
+def app_info_list(method: str, mime: str):
+    """Call an optional Gio.AppInfo class method across GLib versions."""
+    fn = getattr(Gio.AppInfo, method, None)
+    if fn is None:
+        return []
+    try:
+        return fn(mime)
+    except Exception:
+        return []
+
+
+def apps_for_type(mime: str) -> dict[str, Candidate]:
+    bucket: dict[str, Candidate] = {}
+    default = Gio.AppInfo.get_default_for_type(mime, False)
+    default_id = default.get_id() if default else None
+
+    if default:
+        add_apps(bucket, [default], 0, default_id)
+    add_apps(bucket, app_info_list("get_recommended_for_type", mime), 1, default_id)
+    add_apps(bucket, app_info_list("get_fallback_for_type", mime), 2, default_id)
+    add_apps(bucket, app_info_list("get_all_for_type", mime), 3, default_id)
+
+    # Hide NoDisplay=true helpers unless they are the default; Nautilus does
+    # the same.  The default app is kept even when it is hidden.
+    for app_id, candidate in list(bucket.items()):
+        if not candidate.is_default and not candidate.app.should_show():
+            del bucket[app_id]
+
+    return bucket
+
+
+def discover(paths: list[str]) -> tuple[list[str], list[dict]]:
+    mimes: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        mime = content_type(path)
+        if mime not in seen:
+            seen.add(mime)
+            mimes.append(mime)
+
+    per_type = [apps_for_type(mime) for mime in mimes]
+    if not per_type:
+        return [], []
+
+    common = set(per_type[0])
+    for bucket in per_type[1:]:
+        common &= set(bucket)
+
+    selected: list[Candidate] = []
+    for app_id in common:
+        records = [bucket[app_id] for bucket in per_type]
+        candidate = records[0]
+        candidate.rank = max(record.rank for record in records)
+        candidate.is_default = all(record.is_default for record in records)
+        selected.append(candidate)
+
+    selected.sort(key=lambda c: (c.rank, not c.is_default, c.name.casefold(), c.app_id.casefold()))
+    return mimes, [
+        {
+            "id": candidate.app_id,
+            "name": candidate.name,
+            "default": candidate.is_default,
+        }
+        for candidate in selected
+    ]
+
+
+def resolve_app(app_id: str):
+    if GioUnix is not None and hasattr(GioUnix, "DesktopAppInfo"):
+        app = GioUnix.DesktopAppInfo.new(app_id)
+        if app:
+            return app
+
+    desktop_app_info = getattr(Gio, "DesktopAppInfo", None)
+    if desktop_app_info is not None:
+        app = desktop_app_info.new(app_id)
+        if app:
+            return app
+
+    for app in Gio.AppInfo.get_all():
+        if app.get_id() == app_id:
+            return app
+
+    return None
+
+
+def launch(app_id: str, paths: list[str]) -> None:
+    app = resolve_app(app_id)
+    if app is None:
+        raise HelperError(f"application not found: {app_id}")
+
+    files = [Gio.File.new_for_commandline_arg(path) for path in paths]
+    try:
+        context = Gio.AppLaunchContext.new() if hasattr(Gio.AppLaunchContext, "new") else Gio.AppLaunchContext()
+        launched = app.launch(files, context)
+    except GLib.Error as exc:
+        raise HelperError(f"failed to launch {app_id}: {exc}") from exc
+
+    if launched is False:
+        raise HelperError(f"GIO rejected the launch request for {app_id}")
+
+    # Let GIO's "recently used" ordering work like Nautilus.  Failure here is
+    # harmless, so never let it break the launch.
+    for path in paths:
+        try:
+            app.set_as_last_used_for_type(content_type(path))
+        except Exception:
+            pass
+
+
+def emit(payload: dict) -> None:
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="List/launch desktop applications for yazi's open-with plugin."
+    )
+    parser.add_argument("--list", action="store_true", help="print candidate apps as JSON")
+    parser.add_argument("--launch", metavar="DESKTOP_ID", help="launch a desktop application")
+    parser.add_argument("paths", nargs="*", help="file paths (use -- before the list)")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    paths = [path for path in args.paths if path]
+
+    if not paths:
+        emit({"error": "no files given"})
+        return 64
+
+    try:
+        load_gio()
+    except HelperError as exc:
+        emit({"error": str(exc)})
+        return 70
+
+    try:
+        if args.launch:
+            launch(args.launch, paths)
+        elif args.list:
+            mimes, apps = discover(paths)
+            emit({"mimes": mimes, "apps": apps})
+        else:
+            emit({"error": "one of --list or --launch is required"})
+            return 64
+    except HelperError as exc:
+        emit({"error": str(exc)})
+        return 1
+    except Exception as exc:  # pragma: no cover - defensive
+        emit({"error": f"unexpected error: {exc}"})
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
