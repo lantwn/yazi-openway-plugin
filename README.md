@@ -1,6 +1,6 @@
 # open-with.yazi
 
-在 yazi 的**原生 picker** 里列出系统桌面应用，按 `O` 直接选择“用什么打开”。
+在 yazi 的**原生 picker** 里列出系统桌面应用，按大写的 `O` 直接选择“用什么打开”。
 
 它解决的是 yazi 的一个空白：`open --interactive` 只会列出 `[opener]` 里配置过的命令，不会自动读取系统里注册的 MIME 应用。这个插件通过 GIO（Nautilus 使用的同一套数据）发现应用，再把它们临时注入 yazi 的原生 picker。
 
